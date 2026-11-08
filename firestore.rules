@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() {
+      return get(/databases/$(db)/documents/users/$(request.auth.uid)).data;
+    }
+    // الحساب الموقوف (disabled) بيفقد كل صلاحياته
+    function role() {
+      return me().get('disabled', false) == true ? 'none' : me().role;
+    }
+    function isAdmin() { return signedIn() && role() == 'admin'; }
+    function isMerchantOf(storeId) {
+      return role() == 'merchant' && me().storeId == storeId;
+    }
+    // صلاحيات المحاسب/الموظف (users/{uid}.perms) - المدير عنده كله
+    function can(p) {
+      return signedIn() && (role() == 'admin' ||
+        (role() in ['staff', 'accountant'] &&
+         (me().get('perms', {}).get(p, false) == true ||
+          (p == 'viewReports' && me().get('canViewReports', false) == true))));
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // العميل يسجل نفسه customer فقط، والأدمن بس هو اللي ينشئ/يعدّل باقي الأدوار والصلاحيات
+      allow create: if signedIn()
+                    && ((request.auth.uid == uid && request.resource.data.role == 'customer')
+                        || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    // الإيصالات والتقارير والكشوف: الكتابة من السيرفر فقط (Cloud Functions)
+    match /receipts/{id} {
+      allow read: if signedIn() && ((role() == 'courier' && resource.data.courierId == request.auth.uid)
+                                    || can('viewReceipts'));
+      allow write: if false;
+    }
+    match /reports/{date} {
+      allow read: if can('viewReports');
+      allow write: if false;
+      match /parts/{part} {
+        allow read: if can(
+          part == 'merchants' ? 'viewMerchants' :
+          part == 'customers' ? 'viewCustomers' :
+          part == 'couriers' ? 'viewCouriers' :
+          part == 'commissions' ? 'viewCommissions' : 'viewReceipts');
+        allow write: if false;
+      }
+    }
+    match /statements/{id} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid ||
+        (resource.data.kind == 'merchant' ? can('viewMerchants') : can('viewCouriers')));
+      allow write: if false;
+    }
+    match /settings/commission {
+      allow read: if isAdmin() || can('viewCommissions');
+      allow write: if isAdmin();
+    }
+
+    // توكنات الإشعارات: كل توكن (جهاز) تابع لمستخدم واحد
+    match /fcmTokens/{token} {
+      allow read, delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create, update: if signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+
+    match /stores/{id} {
+      allow read: if signedIn();
+      allow create, delete: if isAdmin();
+      // التاجر يعدّل متجره هو بس وفي المنتجات/الأقسام/الصورة فقط (مينفعش يلمس العمولة)
+      allow update: if isAdmin()
+                    || (isMerchantOf(id)
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly(['items', 'categories', 'image']));
+    }
+
+    match /orders/{id} {
+      allow create: if signedIn()
+                    && request.resource.data.userId == request.auth.uid
+                    && request.resource.data.status == 'new';
+      allow read: if signedIn()
+                  && (resource.data.userId == request.auth.uid
+                      || role() in ['admin', 'staff', 'courier']
+                      || isMerchantOf(resource.data.storeId));
+      allow update: if signedIn()
+                    && (isAdmin()
+                        // المندوب: استلام الطلب + مشاركة الموقع فقط. التسليم (delivered) عن طريق confirmDelivery بس
+                        || (role() == 'courier'
+                            && request.resource.data.status != 'delivered'
+                            && request.resource.data.diff(resource.data).affectedKeys()
+                                 .hasOnly(['status', 'courierId', 'courierLoc', 'courierLocAt']))
+                        // التاجر: تغيير حالة طلبات متجره فقط
+                        || (isMerchantOf(resource.data.storeId)
+                            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])));
+    }
+  }
+}
